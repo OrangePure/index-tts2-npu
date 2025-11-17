@@ -13,15 +13,19 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import random
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions, BaseModelOutputWithPastAndCrossAttentions
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, eager_attention_forward, GPT2Model
+from transformers.cache_utils import Cache, EncoderDecoderCache, DynamicCache
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
+
+from torchaudio.compliance.kaldi import POVEY, _get_waveform_and_window_properties, get_mel_banks, _get_window, _get_epsilon, _subtract_column_mean
+
 from indextts.infer_v2 import IndexTTS2, find_most_similar_cosine
 from indextts.s2mel.modules.diffusion_transformer import DiT, sequence_mask
 from indextts.gpt.model_v2 import GPT2InferenceModel, LearnedPositionEmbeddings
 from indextts.s2mel.modules.gpt_fast.model import Attention, apply_rotary_emb
-from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
-from transformers.cache_utils import Cache, EncoderDecoderCache
-from transformers.models.gpt2.modeling_gpt2 import eager_attention_forward
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
 
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
@@ -1055,6 +1059,322 @@ def gpt_attn_forward(
 
     return attn_output, attn_weights
 
+# fbank 里有复数 abs 操作，昇腾 abs 不支持复数，替换为模长公式
+def fbank(
+    waveform: Tensor,
+    blackman_coeff: float = 0.42,
+    channel: int = -1,
+    dither: float = 0.0,
+    energy_floor: float = 1.0,
+    frame_length: float = 25.0,
+    frame_shift: float = 10.0,
+    high_freq: float = 0.0,
+    htk_compat: bool = False,
+    low_freq: float = 20.0,
+    min_duration: float = 0.0,
+    num_mel_bins: int = 23,
+    preemphasis_coefficient: float = 0.97,
+    raw_energy: bool = True,
+    remove_dc_offset: bool = True,
+    round_to_power_of_two: bool = True,
+    sample_frequency: float = 16000.0,
+    snip_edges: bool = True,
+    subtract_mean: bool = False,
+    use_energy: bool = False,
+    use_log_fbank: bool = True,
+    use_power: bool = True,
+    vtln_high: float = -500.0,
+    vtln_low: float = 100.0,
+    vtln_warp: float = 1.0,
+    window_type: str = POVEY,
+) -> Tensor:
+    device, dtype = waveform.device, waveform.dtype
+
+    waveform, window_shift, window_size, padded_window_size = _get_waveform_and_window_properties(
+        waveform, channel, sample_frequency, frame_shift, frame_length, round_to_power_of_two, preemphasis_coefficient
+    )
+
+    if len(waveform) < min_duration * sample_frequency:
+        # signal is too short
+        return torch.empty(0, device=device, dtype=dtype)
+
+    # strided_input, size (m, padded_window_size) and signal_log_energy, size (m)
+    strided_input, signal_log_energy = _get_window(
+        waveform,
+        padded_window_size,
+        window_size,
+        window_shift,
+        window_type,
+        blackman_coeff,
+        snip_edges,
+        raw_energy,
+        energy_floor,
+        dither,
+        remove_dc_offset,
+        preemphasis_coefficient,
+    )
+
+    # size (m, padded_window_size // 2 + 1)
+    #spectrum = torch.fft.rfft(strided_input).abs()  昇腾 abs 不支持复数，替换为模长公式      
+    spectrum = torch.fft.rfft(strided_input)
+    real_view = torch.view_as_real(spectrum)
+    spectrum = torch.sqrt(real_view[..., 0].pow(2) + real_view[..., 1].pow(2))
+    if use_power:
+        spectrum = spectrum.pow(2.0)
+
+    # size (num_mel_bins, padded_window_size // 2)
+    mel_energies, _ = get_mel_banks(
+        num_mel_bins, padded_window_size, sample_frequency, low_freq, high_freq, vtln_low, vtln_high, vtln_warp
+    )
+    mel_energies = mel_energies.to(device=device, dtype=dtype)
+
+    # pad right column with zeros and add dimension, size (num_mel_bins, padded_window_size // 2 + 1)
+    mel_energies = torch.nn.functional.pad(mel_energies, (0, 1), mode="constant", value=0)
+
+    # sum with mel fiterbanks over the power spectrum, size (m, num_mel_bins)
+    mel_energies = torch.mm(spectrum, mel_energies.T)
+    if use_log_fbank:
+        # avoid log of zero (which should be prevented anyway by dithering)
+        mel_energies = torch.max(mel_energies, _get_epsilon(device, dtype)).log()
+
+    # if use_energy then add it as the last column for htk_compat == true else first column
+    if use_energy:
+        signal_log_energy = signal_log_energy.unsqueeze(1)  # size (m, 1)
+        # returns size (m, num_mel_bins + 1)
+        if htk_compat:
+            mel_energies = torch.cat((mel_energies, signal_log_energy), dim=1)
+        else:
+            mel_energies = torch.cat((signal_log_energy, mel_energies), dim=1)
+
+    mel_energies = _subtract_column_mean(mel_energies, subtract_mean)
+    return mel_energies
+
+
+# 修改点
+# 1. 注释 warning，静态图里不能出现。
+# 2. 去掉 position_embeds，会卡静态图。
+def gpt2model_forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Tuple[Tuple[torch.Tensor]], Cache]] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
+        r"""
+        input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
+            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
+            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            sequence tokens in the vocabulary.
+
+            If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
+            `input_ids`.
+
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            [`PreTrainedTokenizer.__call__`] for details.
+
+            [What are input IDs?](../glossary#input-ids)
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
+            input_shape = input_ids.size()
+            input_ids = input_ids.view(-1, input_shape[-1])
+            batch_size = input_ids.shape[0]
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+            batch_size = inputs_embeds.shape[0]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.view(-1, input_shape[-1])
+
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
+
+        # based on pattern from src/transformers/models/whisper/modeling_whisper.py::WhisperDecoder
+        return_legacy_cache = False
+        if use_cache:
+            if past_key_values is None:
+                return_legacy_cache = True
+                past_key_values = DynamicCache()
+            elif not isinstance(past_key_values, Cache):
+                return_legacy_cache = True
+                # logger.warning_once(
+                #     "Passing a tuple of `past_key_values` is deprecated and will be removed in Transformers v4.53.0. "
+                #     "You should pass an instance of `Cache` instead, e.g. "
+                #     "`past_key_values=DynamicCache.from_legacy_cache(past_key_values)`."
+                # )
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+
+            if self.config.add_cross_attention and not isinstance(past_key_values, EncoderDecoderCache):
+                past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
+
+        if inputs_embeds is None:
+            inputs_embeds = self.wte(input_ids)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        position_embeds = self.wpe(position_ids)
+        # hidden_states = inputs_embeds + position_embeds.to(inputs_embeds.device)
+        # hidden_states = inputs_embeds + position_embeds.to(inputs_embeds.device).half() # changed
+        hidden_states = inputs_embeds # position_embeds 是 0
+
+        # Attention mask.
+        # ._update_causal_mask() and ._prepare_4d_causal_attention_mask_with_cache_position() copied from LlamaModel
+        if attention_mask is not None and attention_mask.ndim < 4:
+            attention_mask = attention_mask.view(batch_size, -1)
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        )
+
+        # If a 2D or 3D attention mask is provided for the cross-attention
+        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        _use_sdpa = self._attn_implementation == "sdpa" and output_attentions is False and head_mask is None
+        if self.config.add_cross_attention and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+            if _use_sdpa:
+                encoder_attention_mask = _prepare_4d_attention_mask_for_sdpa(
+                    mask=encoder_attention_mask, dtype=inputs_embeds.dtype, tgt_len=input_shape[-1]
+                )
+            elif not self._attn_implementation == "flash_attention_2":
+                encoder_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_attention_mask = None
+
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape bsz x n_heads x N x N
+        # head_mask has shape n_layer x batch x n_heads x N x N
+        head_mask = self.get_head_mask(head_mask, self.config.n_layer)
+
+        if token_type_ids is not None:
+            token_type_embeds = self.wte(token_type_ids)
+            hidden_states = hidden_states + token_type_embeds
+
+        hidden_states = self.drop(hidden_states)
+
+        output_shape = (-1,) + input_shape[1:] + (hidden_states.size(-1),)
+
+        all_self_attentions = () if output_attentions else None
+        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+        all_hidden_states = () if output_hidden_states else None
+        for i, block in enumerate(self.h):
+            # Model parallel
+            if self.model_parallel:
+                torch.cuda.set_device(hidden_states.device)
+                # Ensure that attention_mask is always on the same device as hidden_states
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(hidden_states.device)
+                if isinstance(head_mask, torch.Tensor):
+                    head_mask = head_mask.to(hidden_states.device)
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            if self.gradient_checkpointing and self.training:
+                outputs = self._gradient_checkpointing_func(
+                    block.__call__,
+                    hidden_states,
+                    past_key_values,
+                    cache_position,
+                    causal_mask,
+                    head_mask[i],
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    use_cache,
+                    output_attentions,
+                )
+            else:
+                outputs = block(
+                    hidden_states,
+                    past_key_value=past_key_values,
+                    cache_position=cache_position,
+                    attention_mask=causal_mask,
+                    head_mask=head_mask[i],
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    **kwargs,
+                )
+
+            hidden_states = outputs[0]
+
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (outputs[1],)
+                if self.config.add_cross_attention:
+                    all_cross_attentions = all_cross_attentions + (outputs[2],)
+
+            # Model Parallel: If it's the last layer for that device, put things on the next device
+            if self.model_parallel:
+                for k, v in self.device_map.items():
+                    if i == v[-1] and "cuda:" + str(k) != self.last_device:
+                        hidden_states = hidden_states.to("cuda:" + str(k + 1))
+
+        hidden_states = self.ln_f(hidden_states)
+
+        hidden_states = hidden_states.view(output_shape)
+        # Add last hidden state
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        past_key_values = past_key_values if use_cache else None
+        if return_legacy_cache:
+            past_key_values = (
+                past_key_values.self_attention_cache.to_legacy_cache()
+                if self.config.add_cross_attention
+                else past_key_values.to_legacy_cache()
+            )
+        if not return_dict:
+            return tuple(
+                v
+                for v in [hidden_states, past_key_values, all_hidden_states, all_self_attentions, all_cross_attentions]
+                if v is not None
+            )
+
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+            cross_attentions=all_cross_attentions,
+        )
+
+
 # 函数替换
 IndexTTS2.infer_fast = infer_fast
 IndexTTS2.make_batch = make_batch
@@ -1066,6 +1386,8 @@ DiT.forward_original = dit_forward
 DiT.forward = dit_forward_wapper
 Attention.forward = dit_attn_forward
 GPT2Attention.forward = gpt_attn_forward
+torchaudio.compliance.kaldi.fbank=fbank
+GPT2Model.forward = gpt2model_forward
 
 if __name__ == "__main__":
     import os
