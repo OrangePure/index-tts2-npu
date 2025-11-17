@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import random
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
-from infer_v2 import IndexTTS2, find_most_similar_cosine
+from indextts.infer_v2 import IndexTTS2, find_most_similar_cosine
 from indextts.s2mel.modules.diffusion_transformer import DiT, sequence_mask
 from indextts.gpt.model_v2 import GPT2InferenceModel, LearnedPositionEmbeddings
 from indextts.s2mel.modules.gpt_fast.model import Attention, apply_rotary_emb
@@ -100,9 +100,7 @@ class IndexTTS2NPU(IndexTTS2):
         self.s2mel.models['cfm'].estimator.compiled_transformer = None
 
         self.gpt.inference_model.static = self.static
-        config = torchair.CompilerConfig()
-        npu_backend = torchair.get_npu_backend(compiler_config=config)
-        self.gpt.inference_model.compiled_transformer=torchair.inference.cache_compile(self.gpt.inference_model.decode_with_embedding, dynamic=not self.static, fullgraph=True, backend=npu_backend, ge_cache=True)
+        self.gpt.inference_model.compiled_transformer=None
 
 
 def infer_fast(self, spk_audio_prompt, text, output_path,
@@ -248,6 +246,7 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
         current_max_tokens = min(MAX_TOKENS_PER_SEGMENT, total_tokens)
         
         # 二分查找最佳的max_text_tokens_per_segment
+        # TODO 这个二分意义不明，从大到小枚举就行了。
         best_segments = None
         best_batch_size = None
         
@@ -803,6 +802,10 @@ def gpt_forward(
     
     # 获取当前 batch_size
     batch_size = input_ids.shape[0]
+    if self.static and self.compiled_transformer is None:
+        config = torchair.CompilerConfig()
+        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        self.compiled_transformer = torchair.inference.cache_compile(self.decode_with_embedding, dynamic=not self.static, fullgraph=True, backend=npu_backend, ge_cache=True)
     
     if input_ids.shape[1] != 1:
         text_inputs = input_ids[:, mel_len:]
@@ -839,6 +842,8 @@ def gpt_forward(
         )
     else:
         # breakpoint()
+        if input_ids.shape[0] == 1:
+            input_ids = input_ids.squeeze(0).unsqueeze(0) # bs=1 .contiguous 不会改 stride, 用这种方式清除 stride 变化
         transformer_outputs = self.compiled_transformer(
             input_ids=input_ids.contiguous(), # 防止重编译
             past_key_values=past_key_values,
@@ -1109,23 +1114,23 @@ if __name__ == "__main__":
     tts = IndexTTS2NPU(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_cuda_kernel=True, use_fp16=True, static=True)
     # breakpoint()
     prompt_wav = "examples/voice_01.wav"
-    # length=25
-    # text = 'a' * length # warmup
-    # tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=False)
+    length=10
+    text = 'a' * length # warmup
+    tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=False)
     if enable_prof: 
         prof.start()
-        text='测试，测试，测试，测试，测试'
-        tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen2.wav", verbose=False, max_text_tokens_per_segment=6, num_beams=1, auto_split=False)
+        text='测试，测试，测试，测试'
+        tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen2.wav", verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=False)
     else:
         output_dir='output'
         file='gen2.wav'
         path=output_dir+'/'+file
         prompt_wav = "examples/voice_01.wav"
-        text = '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。朝辞白帝彩云间，千里江陵一日还。两岸猿声啼不住，轻舟已过万重山。风急天高猿啸哀，渚清沙白鸟飞回。无边落木萧萧下，不尽长江滚滚来。万里悲秋常作客，百年多病独登台。艰难苦恨繁霜鬓，潦倒新停浊酒杯。唧唧复唧唧，木兰当户织。不闻机杼声，惟闻女叹息。脱我战时袍，著我旧时裳。当窗理云鬓，对镜帖花黄。明月几时有？把酒问青天。不知天上宫阙，今夕是何年。我欲乘风归去，又恐琼楼玉宇，高处不胜寒。起舞弄清影，何似在人间。但愿人长久，千里共婵娟。千山鸟飞绝，万径人踪灭。孤舟蓑笠翁，独钓寒江雪。故人西辞黄鹤楼，烟花三月下扬州。孤帆远影碧空尽，唯见长江天际流。'
-        tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path=path, verbose=False, max_text_tokens_per_segment=120, num_beams=1)
-        meta='|'.join([file, '翻译翻译什么叫惊喜', 'voice_01.wav', text, ''])
-        with open('meta.lst', 'w', encoding='utf-8') as f:
-            f.write(meta)
+        text = '翻译翻译什么叫惊喜'
+        tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path=path, verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=False)
+        # meta='|'.join([file, '翻译翻译什么叫惊喜', 'voice_01.wav', text, ''])
+        # with open('meta.lst', 'w', encoding='utf-8') as f:
+        #     f.write(meta)
         # loop=2
         # for length in [256, 300, 400, 512, 800, 1024]:
         #     print('testing length: ', length)
