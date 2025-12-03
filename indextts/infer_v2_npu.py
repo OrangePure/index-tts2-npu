@@ -8,6 +8,9 @@ import warnings
 import string
 from typing import Callable, Optional, Tuple, Union
 import torch.nn.functional as F
+import einops
+from torch import nn
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -18,25 +21,30 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, eager_attentio
 from transformers.cache_utils import Cache, EncoderDecoderCache, DynamicCache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
-
+from transformers.generation.logits_process import (
+    LogitsProcessorList
+)
+from transformers.generation.stopping_criteria import (StoppingCriteriaList)
+from transformers.generation.configuration_utils import (GenerationConfig)
 from torchaudio.compliance.kaldi import POVEY, _get_waveform_and_window_properties, get_mel_banks, _get_window, _get_epsilon, _subtract_column_mean
 
 from indextts.infer_v2 import IndexTTS2, find_most_similar_cosine
 from indextts.s2mel.modules.diffusion_transformer import DiT, sequence_mask
 from indextts.gpt.model_v2 import GPT2InferenceModel, LearnedPositionEmbeddings
-from indextts.s2mel.modules.gpt_fast.model import Attention, apply_rotary_emb
-
+from indextts.gpt.transformers_generation_utils import GenerateNonBeamOutput, GenerationMixin, GenerateEncoderDecoderOutput, GenerateDecoderOnlyOutput
+from indextts.s2mel.modules.bigvgan.alias_free_activation.torch.resample import UpSample1d
+from indextts.s2mel.modules import gpt_fast
+from indextts.s2mel.modules import encodec
+from indextts.s2mel.modules.flow_matching import CFM
 
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
 import torchair
 
-os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache' # TODO: remove
-
 # 批次大小列表，开启 auto_split 时只会用这些大小的 batch size，减少因为 batch size 变化导致重编译次数。
-DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+DEFAULT_BATCH_SIZES = [1, 2, 4, 8]
 
-# 音频切割后对齐到 batch 内最大长度
+# New function: Pad text tokens to create a batch.
 def make_batch(self, sentences, pad_token_id):
     text_tokens = [self.tokenizer.convert_tokens_to_ids(sent) for sent in sentences]
     lens = torch.tensor([len(tokens) for tokens in text_tokens],dtype=torch.int32, device=self.device)
@@ -83,6 +91,74 @@ def _prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, 
         )
     return combined_attention_mask
 
+# Modified CFM.solve_euler: Correctly handle batch expansion for Classifier-Free Guidance (CFG) on NPU.
+def solve_euler(self, x, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate=0.5):
+    t, _, _ = t_span[0], t_span[-1], t_span[1] - t_span[0]
+    # I am storing this because I can later plot it by putting a debugger here and saving it to a file
+    # Or in future might add like a return_all_steps flag
+    sol = []
+    # apply prompt
+    prompt_len = prompt.size(-1)
+    prompt_x = torch.zeros_like(x)
+    prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
+    x[..., :prompt_len] = 0
+    if self.zero_prompt_speech_token:
+        mu[..., :prompt_len] = 0
+    if inference_cfg_rate > 0:
+        x_lens = x_lens.repeat(2)
+    for step in tqdm(range(1, len(t_span))):
+        dt = t_span[step] - t_span[step - 1]
+        if inference_cfg_rate > 0:
+            # Stack original and CFG (null) inputs for batched processing
+            stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
+            # style repeat if needed
+            if style.size(0) != x.size(0):
+                style = style.repeat(x.size(0) // style.size(0), 1)
+            stacked_style = torch.cat([style, torch.zeros_like(style)], dim=0)
+            if mu.size(0) != x.size(0):
+                mu = mu.repeat(x.size(0) // mu.size(0), 1, 1)
+            stacked_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
+            stacked_x = torch.cat([x, x], dim=0)
+            stacked_t = torch.cat([t.unsqueeze(0), t.unsqueeze(0)], dim=0)
+            stacked_t = stacked_t.repeat(stacked_x.size(0) // stacked_t.size(0))
+            # breakpoint()
+            # Perform a single forward pass for both original and CFG inputs
+            stacked_dphi_dt = self.estimator(
+                stacked_x, stacked_prompt_x, x_lens, stacked_t, stacked_style, stacked_mu,
+            )
+
+            # Split the output back into the original and CFG components
+            dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
+
+            # Apply CFG formula
+            dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
+        else:
+            dphi_dt = self.estimator(x, prompt_x, x_lens, t.unsqueeze(0), style, mu)
+
+        x = x + dt * dphi_dt
+        t = t + dt
+        sol.append(x)
+        if step < len(t_span) - 1:
+            dt = t_span[step + 1] - t
+        x[:, :, :prompt_len] = 0
+    return sol[-1]
+
+class Sampler(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        temperatures = temperatures.to(logits.device).clamp(min=1e-8)
+        greedy_mask = temperatures < 1e-5
+        temp_for_scaling = torch.where(greedy_mask, 1.0, temperatures)
+        scaled_logits = logits / temp_for_scaling.unsqueeze(-1)
+        probs = torch.softmax(scaled_logits, dim=-1, dtype=torch.float32)
+        q = torch.empty_like(probs)
+        q.exponential_()
+        sampled_tokens = probs.div_(q).argmax(dim=-1)
+        greedy_tokens = logits.argmax(dim=-1)
+        return torch.where(greedy_mask, greedy_tokens, sampled_tokens)
+
 class IndexTTS2NPU(IndexTTS2):
     def __init__(self, static=False, *args, **kwargs):
         """
@@ -97,16 +173,30 @@ class IndexTTS2NPU(IndexTTS2):
         self.gpt.static = static
         for block in self.gpt.inference_model.transformer.h:
             block.attn.static = static
-        # DiT 模块传递静态图模式参数
-        self.s2mel.models['cfm'].estimator.static=static
-        self.s2mel.models['cfm'].estimator.max_seq_len=2147
-        self.s2mel.models['cfm'].estimator.padding_token=8193 # TODO: 改成 stop_mel_token
-        self.s2mel.models['cfm'].estimator.compiled_transformer = None
+        
+        model = self.s2mel.models['cfm'].estimator
+        for module in model.wavenet.modules():
+            if hasattr(module, 'pad_mode'):
+                module.pad_mode = 'constant'
+        torch.nn.utils.remove_weight_norm(model.wavenet.cond_layer.conv.conv)
+        for layer in model.wavenet.in_layers:
+            torch.nn.utils.remove_weight_norm(layer.conv.conv)
+        for layer in model.wavenet.res_skip_layers:
+            torch.nn.utils.remove_weight_norm(layer.conv.conv)
+        torch.nn.utils.remove_weight_norm(model.final_layer.linear)
+        config = torchair.CompilerConfig()
+        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        compiled = torch.compile(model, dynamic=False, fullgraph=True, backend=npu_backend)
+        pad_wrapper = DiTPadWrapper(compiled).npu()
+        self.s2mel.models['cfm'].estimator = pad_wrapper
 
         self.gpt.inference_model.static = self.static
         self.gpt.inference_model.compiled_transformer=None
+        self.gpt.inference_model.sampler = Sampler()
 
 
+# Modified IndexTTS2.infer_fast: Modified from `IndexTTS2.infer` to support batching and NPU optimizations.
+# Key changes: batch processing logic, `auto_split` for static graph, NPU-specific autocast.
 def infer_fast(self, spk_audio_prompt, text, output_path,
             emo_audio_prompt=None, emo_alpha=1.0,
             emo_vector=None,
@@ -139,7 +229,10 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
     if use_emo_text:
         # automatically generate emotion vectors from text prompt
         if emo_text is None:
-            emo_text = text  # use main text prompt
+            if isinstance(text, list):
+                emo_text = ''.join(text)  # use main text prompt
+            else:
+                emo_text = text
         emo_dict = self.qwen_emo.inference(emo_text)
         print(f"detected emotion vectors from text: {emo_dict}")
         # convert ordered dict to list of vectors; the order is VERY important!
@@ -238,8 +331,16 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
         emo_cond_emb = self.cache_emo_cond
 
     self._set_gr_progress(0.1, "text processing...")
-    text_tokens_list = self.tokenizer.tokenize(text)
-    print('total tokens: ', len(text_tokens_list))
+    split=False
+    if isinstance(text, list):
+        text_tokens_list = []
+        for t in text:
+            text_tokens_list.append(self.tokenizer.tokenize(t))
+        split=True
+        print('total tokens: ', [len(x) for x in text_tokens_list])
+    else:
+        text_tokens_list = self.tokenizer.tokenize(text)
+        print('total tokens: ', len(text_tokens_list))
     
     # 根据auto_split参数决定是否自动切割
     if auto_split:
@@ -250,7 +351,6 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
         current_max_tokens = min(MAX_TOKENS_PER_SEGMENT, total_tokens)
         
         # 二分查找最佳的max_text_tokens_per_segment
-        # TODO 这个二分意义不明，从大到小枚举就行了。
         best_segments = None
         best_batch_size = None
         
@@ -274,11 +374,13 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
             best_batch_size = len(best_segments)
             
         segments = best_segments
-    else:
+    elif not split:
         # 不自动切割，使用用户指定的max_text_tokens_per_segment
         segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
         best_batch_size = len(segments)
-    
+    else:
+        segments = text_tokens_list
+        best_batch_size = len(segments)
     # 处理批次对齐
     if auto_split:
         # 确定目标批次大小
@@ -429,16 +531,20 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
                     category=RuntimeWarning
                 )
                 has_warned = True
-
             code_lens = []
+            max_code_len = 0
             for code in codes:
                 if self.stop_mel_token not in code:
                     code_len = len(code)
                 else:
-                    len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
-                    code_len = len_ - 1
+                    len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0]
+                    code_len = len_[0].item() if len_.numel() > 0 else len(code)
                 code_lens.append(code_len)
-            code_lens = torch.LongTensor(code_lens).to(self.device)
+                max_code_len = max(max_code_len, code_len)
+            print(code_lens)
+            codes = codes[:, :max_code_len]
+            code_lens = torch.LongTensor(code_lens)
+            code_lens = code_lens.to(self.device)
 
             m_start_time = time.perf_counter()
             use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
@@ -527,63 +633,50 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
         wav_data = wav_data.numpy().T
         return (sampling_rate, wav_data)
 
-# 在原来 DiT 外面包了一层 padding 和图编译逻辑
-def dit_forward_wapper(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
-    if self.static:
-        T_max = self.max_seq_len
-        T_actual = x.size(2)
-        if T_actual > T_max:
-            # 截断输入
-            x = x[..., :T_max]
-            prompt_x = prompt_x[..., :T_max]
-            cond = cond[:, :T_max, :]
-            # 同样需要钳制长度张量，否则掩码会出错
-            x_lens = torch.clamp(x_lens, max=T_max)
-        elif T_actual < T_max:
-            # 填充输入
-            pad_len = T_max - T_actual
-            # x 和 prompt_x (B, C, T) -> 填充最后一个维度
+supported_batch_sizes = [x*2 for x in DEFAULT_BATCH_SIZES]
+supported_lengths = [512, 1024, 2048]
+torch._dynamo.config.cache_size_limit = 32 # gpt 占 8 张图，s2mel 占 12 张图。再预留 12 个缓存位置。
+
+def find_target_size(batch_size, seq_len):
+    # 查找最接近的支持尺寸
+    for B in supported_batch_sizes:
+        if B >= batch_size:
+            batch_size = B
+            break
+    for L in supported_lengths:
+        if L >= seq_len:
+            seq_len = L
+            break
+    return batch_size, seq_len
+
+class DiTPadWrapper(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
+        B, L = x.shape[0], x.shape[2]
+        target_batch_size, target_seq_len = find_target_size(B, L)
+        pad_len = target_seq_len - L
+        if pad_len > 0:
             x = F.pad(x, (0, pad_len))
             prompt_x = F.pad(prompt_x, (0, pad_len))
-            # cond (B, T, C) -> 填充倒数第二个维度
             cond = F.pad(cond, (0, 0, 0, pad_len))
-        if self.compiled_transformer is None:
-            import torch_npu
-            import torchair
-            config = torchair.CompilerConfig()
-            npu_backend = torchair.get_npu_backend(compiler_config=config)
-            self.compiled_transformer = torchair.inference.cache_compile(self.transformer.forward, dynamic=False, fullgraph=True, backend=npu_backend, ge_cache=True)
-        return self.forward_original(x, prompt_x, x_lens, t, style, cond, mask_content)[..., :T_actual]
-    else:
-        self.compiled_transformer = None
-    return self.forward_original(x, prompt_x, x_lens, t, style, cond, mask_content)
+        bs_pad = target_batch_size - B
+        if bs_pad > 0:
+            x = F.pad(x, (0,0,0,0,0,bs_pad))
+            prompt_x = F.pad(prompt_x, (0,0,0,0,0,bs_pad))
+            cond = F.pad(cond, (0,0,0,0,0, bs_pad))
+            x_lens = F.pad(x_lens, (0, bs_pad))
+            t = F.pad(t, (0, bs_pad))
+            style = F.pad(style, (0, 0, 0, bs_pad))
+        out = self.module(x, prompt_x, x_lens, t, style, cond, mask_content)
+        # breakpoint()
+        return out[:B, :, :L]
 
-# 修改 DiT 原来的 forward
-# 1. mask padding 到最大长度以支持静态图
-# 2. 一些 batch_size=1 输入填充到 x.shape[0]
+
+# Modified DiT.forward: Modified `DiT.forward` for NPU. Changes mask generation logic and uses `logical_not()` for attention mask.
 def dit_forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
-    """
-        x (torch.Tensor): random noise
-            shape: (batch_size, 80, T)
-        prompt_x (torch.Tensor): reference mel + zero mel
-            shape: (batch_size, 80, T)
-        x_lens (torch.Tensor): mel frames output
-            shape: (batch_size, 1)
-        t (torch.Tensor): radshape: 
-            shape: (batch_size, 2)    
-        style (torch.Tensor): reference global style
-            shape: (batch_size, 192)
-        cond (torch.Tensor): semantic info of reference audio and altered audio
-            shape: (batch_size, T, 512)
-    
-    """
-    if style is not None and style.size(0) != x.size(0):  
-        style = style.repeat(x.size(0)//style.size(0), 1)
-    if t is not None and t.size(0) != x.size(0):
-        t = t.repeat(x.size(0)//t.size(0))
-    if x_lens is not None and x_lens.size(0) != x.size(0):
-        x_lens = x_lens.repeat(x.size(0)//x_lens.size(0))
-
     class_dropout = False
     if self.training and torch.rand(1) < self.class_dropout_prob:
         class_dropout = True
@@ -600,7 +693,7 @@ def dit_forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
 
     x = x.transpose(1, 2) # [2,1863,80]
     prompt_x = prompt_x.transpose(1, 2) # [2,1863,80]
-
+    # breakpoint()
     x_in = torch.cat([x, prompt_x, cond], dim=-1) # 80+80+512=672 [2, 1863, 672]
     
     if self.transformer_style_condition and not self.style_as_token: # True and True
@@ -618,42 +711,22 @@ def dit_forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
         
     if self.time_as_token: # False
         x_in = torch.cat([t1.unsqueeze(1), x_in], dim=1)
-    
-    if self.static:
-        # --- 关键修改 ---
-        # 1. 获取 x_in 的总序列长度 (T_max + 可能的
-        T_seq = x_in.size(1) 
-        
-        # 2. 确保 x_lens 是 1D 张量 (B,) 以便广播
-        # (x_lens 可能本是 (B, 1))
-        mask_lengths = (x_lens + self.style_as_token + self.time_as_token).squeeze(-1) 
-        
-        # 3. 显式地将 T_seq 作为 max_length 传递给 sequence_mask
-        # 假设 sequence_mask 函数已按上面示例定义
-        x_mask = sequence_mask(mask_lengths, max_length=T_seq).to(x.device).unsqueeze(1) #torch.Size([B, 1, T_seq])
-        # breakpoint()
-        # --- 修改结束 ---
-    else:    
-        x_mask = sequence_mask(x_lens + self.style_as_token + self.time_as_token).to(x.device).unsqueeze(1) #torch.Size([1, 1, 1863])True
-    # breakpoint()
+
+    x_mask = sequence_mask(x_lens + self.style_as_token + self.time_as_token, max_length=x_in.size(1)).to(x.device).unsqueeze(1) #torch.Size([1, 1, 1863])True
     input_pos = self.input_pos[:x_in.size(1)]  # (T,) range（0，1863）
-    # x_mask_expanded = x_mask[:, None, :].repeat(1, 1, x_in.size(1), 1) if not self.is_causal else None # torch.Size([1, 1, 1863, 1863]
-    x_mask_expanded = x_mask.unsqueeze(-1) * x_mask.unsqueeze(-2)
-    
-    # 使用传入的 compiled_transformer 参数
-    if self.compiled_transformer is None:
-        x_res = self.transformer(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded) # [2, 1863, 512]
-    else:
-        x_res = self.compiled_transformer(x_in, t1.unsqueeze(1), input_pos=input_pos, mask=x_mask_expanded, context=None, context_input_pos=None, cross_attention_mask=None) # [2, 1863, 512]
+    x_mask_expanded = x_mask.unsqueeze(-1)&x_mask.unsqueeze(-2)
+    x_res = self.transformer(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded.logical_not()) # [2, 1863, 512]
     x_res = x_res[:, 1:] if self.time_as_token else x_res
     x_res = x_res[:, 1:] if self.style_as_token else x_res
-    
+    # breakpoint()
+
     if self.long_skip_connection: #True
         x_res = self.skip_linear(torch.cat([x_res, x], dim=-1))
     if self.final_layer_type == 'wavenet':
         x = self.conv1(x_res)
         x = x.transpose(1, 2)
         t2 = self.t_embedder2(t)
+        x = x*x_mask # 模拟 0 padding
         x = self.wavenet(x, x_mask, g=t2.unsqueeze(2)).transpose(1, 2) + self.res_projection(
             x_res)  # long residual connection
         x = self.final_layer(x, t1).transpose(1, 2)
@@ -664,6 +737,7 @@ def dit_forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
     # x [2,80,1863]
     return x
 
+# New function: Wrapper for `transformer` forward pass to facilitate `torch.compile` on NPU.
 def decode_with_embedding(self, input_ids=None,
                 past_key_values=None,
                 attention_mask=None,
@@ -699,6 +773,7 @@ def decode_with_embedding(self, input_ids=None,
             updated_kv_positions=updated_kv_positions,
         )
 
+# Modified GPT2InferenceModel.prepare_inputs_for_generation: Modified to support static graph execution. Prepares fixed-shape attention masks and position IDs.
 def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
     token_type_ids = kwargs.get("token_type_ids", None)  # usually None
     if not self.kv_cache:
@@ -773,9 +848,10 @@ def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwarg
         "attention_mask": attention_mask,
         "token_type_ids": token_type_ids,
         'updated_kv_positions': updated_kv_positions,
-        'real_seq_len': src_len,
+        # 'real_seq_len': src_len,
     }
 
+# Modified GPT2InferenceModel.forward: Modified to use compiled transformer if static mode is enabled. Handles input reshaping for static graph.
 def gpt_forward(
         self,
         input_ids=None,
@@ -809,7 +885,8 @@ def gpt_forward(
     if self.static and self.compiled_transformer is None:
         config = torchair.CompilerConfig()
         npu_backend = torchair.get_npu_backend(compiler_config=config)
-        self.compiled_transformer = torchair.inference.cache_compile(self.decode_with_embedding, dynamic=not self.static, fullgraph=True, backend=npu_backend, ge_cache=True)
+        self.compiled_transformer = torch.compile(self.decode_with_embedding, 
+        dynamic=False, fullgraph=True, backend=npu_backend)
     
     if input_ids.shape[1] != 1:
         text_inputs = input_ids[:, mel_len:]
@@ -827,7 +904,7 @@ def gpt_forward(
         emb = emb + self.text_pos_embedding.get_fixed_embedding(
             attention_mask.shape[1] - mel_len, attention_mask.device
         )
-    # breakpoint()
+    # print(input_ids)
     if input_ids.shape[1] != 1 or self.compiled_transformer is None:
         transformer_outputs = self.transformer(
             inputs_embeds=emb,
@@ -862,7 +939,7 @@ def gpt_forward(
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             updated_kv_positions=updated_kv_positions,
-            trunc_index=torch.tensor(real_seq_len+1-mel_len,device=input_ids.device),
+            trunc_index=real_seq_len,
         )
     
     # breakpoint()
@@ -890,9 +967,11 @@ def gpt_forward(
         cross_attentions=transformer_outputs.cross_attentions,
     )
 
+# New function: Allows tensor input for position index, required for static graph compilation.
 def get_fixed_embedding_with_tensor_input(self, ind):
     return self.emb(ind).unsqueeze(0)
 
+# Modified gpt_fast.model.Attention.forward: Modified to use `torch_npu.npu_fused_infer_attention_score` and `rotate_emb_npu`.
 def dit_attn_forward(self,
             x: Tensor,
             freqs_cis: Tensor,
@@ -902,7 +981,7 @@ def dit_attn_forward(self,
             context_freqs_cis: Optional[Tensor] = None,
             ) -> Tensor:
     bsz, seqlen, _ = x.shape
-
+    # breakpoint()
     kv_size = self.n_local_heads * self.head_dim
     if context is None:
         q, k, v = self.wqkv(x).split([kv_size, kv_size, kv_size], dim=-1)
@@ -916,8 +995,8 @@ def dit_attn_forward(self,
     k = k.view(bsz, context_seqlen, self.n_local_heads, self.head_dim)
     v = v.view(bsz, context_seqlen, self.n_local_heads, self.head_dim)
 
-    q = apply_rotary_emb(q, freqs_cis)
-    k = apply_rotary_emb(k, context_freqs_cis if context_freqs_cis is not None else freqs_cis)
+    q = rotate_emb_npu(q, freqs_cis)
+    k = rotate_emb_npu(k, context_freqs_cis if context_freqs_cis is not None else freqs_cis)
 
     q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
@@ -932,10 +1011,10 @@ def dit_attn_forward(self,
     k=k.contiguous().half()
     v=v.contiguous().half()
     scale=1.0 / (D**0.5)
-    # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+    # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.logical_not(), dropout_p=0.0)
     y, _ = torch_npu.npu_fused_infer_attention_score(
         q, k, v,
-        atten_mask=mask.logical_not(),
+        atten_mask=mask,
         num_heads=N,
         scale=scale,
         input_layout='BNSD'
@@ -946,6 +1025,7 @@ def dit_attn_forward(self,
     y = self.wo(y)
     return y
 
+# Modified GPT2Attention.forward: Modified to use `torch_npu.npu_fused_infer_attention_score` for accelerated attention on NPU. Handles static KV cache updates.
 def gpt_attn_forward(
     self,
     hidden_states: Optional[Tuple[torch.FloatTensor]],
@@ -1059,7 +1139,7 @@ def gpt_attn_forward(
 
     return attn_output, attn_weights
 
-# fbank 里有复数 abs 操作，昇腾 abs 不支持复数，替换为模长公式
+# Modified torchaudio.compliance.kaldi.fbank: Modified to calculate magnitude manually as Ascend NPU `abs()` does not support complex numbers.
 def fbank(
     waveform: Tensor,
     blackman_coeff: float = 0.42,
@@ -1150,9 +1230,7 @@ def fbank(
     return mel_energies
 
 
-# 修改点
-# 1. 注释 warning，静态图里不能出现。
-# 2. 去掉 position_embeds，会卡静态图。
+# Modified GPT2Model.forward: Modified to remove `position_embeds` calculation (set to 0) to avoid static graph issues.
 def gpt2model_forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1374,6 +1452,245 @@ def gpt2model_forward(
             cross_attentions=all_cross_attentions,
         )
 
+# Modified GenerationMixin._sample: Custom sampling loop with throughput calculation and NPU-compatible sampler.
+def _sample(
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
+        synced_gpus: bool,
+        streamer: Optional["BaseStreamer"],
+        **model_kwargs,
+    ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+        r"""
+        Generates sequences of token ids for models with a language modeling head using **multinomial sampling** and
+        can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
+
+        Parameters:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                The sequence used as a prompt for the generation.
+            logits_processor (`LogitsProcessorList`):
+                An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
+                used to modify the prediction scores of the language modeling head applied at each generation step.
+            stopping_criteria (`StoppingCriteriaList`):
+                An instance of [`StoppingCriteriaList`]. List of instances of class derived from [`StoppingCriteria`]
+                used to tell if the generation loop should stop.
+            generation_config ([`~generation.GenerationConfig`]):
+                The generation configuration to be used as parametrization of the decoding method.
+            synced_gpus (`bool`):
+                Whether to continue running the while loop until max_length (needed to avoid deadlocking with
+                `FullyShardedDataParallel` and DeepSpeed ZeRO Stage 3).
+            streamer (`BaseStreamer`, *optional*):
+                Streamer object that will be used to stream the generated sequences. Generated tokens are passed
+                through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
+            model_kwargs:
+                Additional model specific kwargs will be forwarded to the `forward` function of the model. If model is
+                an encoder-decoder model the kwargs should include `encoder_outputs`.
+
+        Return:
+            [`~generation.GenerateDecoderOnlyOutput`], [`~generation.GenerateEncoderDecoderOutput`] or `torch.LongTensor`:
+            A `torch.LongTensor` containing the generated tokens (default behaviour) or a
+            [`~generation.GenerateDecoderOnlyOutput`] if `model.config.is_encoder_decoder=False` and
+            `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
+            `model.config.is_encoder_decoder=True`.
+        """
+        # init values
+        pad_token_id = generation_config._pad_token_tensor
+        eos_token_id = generation_config._eos_token_tensor
+        output_attentions = generation_config.output_attentions
+        output_hidden_states = generation_config.output_hidden_states
+        output_scores = generation_config.output_scores
+        output_logits = generation_config.output_logits
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        max_length = generation_config.max_length
+        has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
+        temperature = generation_config.temperature
+        do_sample = generation_config.do_sample
+
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        raw_logits = () if (return_dict_in_generate and output_logits) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
+
+        # keep track of which sequences are already finished
+        batch_size, cur_len = input_ids.shape
+        this_peer_finished = False
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+        all_times = []
+        real_seq_len = None
+        CHECK_INTEVAL=10
+        for round in range(max_length):
+            start_time = time.perf_counter()
+            # prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if real_seq_len is None:
+                real_seq_len = torch.tensor([input_ids.shape[1]-self.cached_mel_emb.shape[1]], dtype=torch.int,device=input_ids.device)
+            else:
+                real_seq_len += 1
+            model_inputs['real_seq_len'] = real_seq_len
+            # prepare variable output controls (note: some models won't accept all output controls)
+            model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
+            model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
+
+            # forward pass to get next token
+            outputs = self(**model_inputs, return_dict=True)
+
+            # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+            )
+            if synced_gpus and this_peer_finished:
+                continue
+
+            # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
+            # (the clone itself is always small)
+            next_token_logits = outputs.logits.clone()[:, -1, :].float()
+            next_token_logits = next_token_logits.to(input_ids.device)
+
+            temperatures = torch.full((batch_size, ), temperature, device=input_ids.device) 
+            if temperature > 0:
+                next_tokens = self.sampler(next_token_logits, temperatures)
+            else:
+                next_tokens = torch.argmax(next_token_logits, dim=-1)
+
+            # finished sentences should have their next token be a padding token
+            if has_eos_stopping_criteria:
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # update generated ids, model inputs, and length for next step
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if streamer is not None:
+                streamer.put(next_tokens.cpu())
+            finished_flag = next_tokens == eos_token_id
+            unfinished_sequences = unfinished_sequences & ~finished_flag
+            if round % CHECK_INTEVAL == 0:
+                if unfinished_sequences.max() == 0:
+                    break
+            cur_len += 1
+            # This is needed to properly delete outputs.logits which may be very large for first iteration
+            # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
+            del outputs
+            end_time = time.perf_counter()
+            elapsed_time_ms = (end_time - start_time) * 1000
+            all_times.append(elapsed_time_ms)
+        ttft = all_times[0]
+        if len(all_times) > 1:
+            tpot = sum(all_times[1:]) / (len(all_times) - 1)
+            throughput = (len(all_times) - 1) / (sum(all_times[1:]) / 1000) # tokens/sec
+        else:
+            tpot = 0
+            throughput = 0
+        ttft /= batch_size
+        tpot /= batch_size
+        throughput *= batch_size
+        total_time = sum(all_times)
+        print(f'{len(all_times)} tokens generated.\nTTFT: {ttft}ms, TPOT: {tpot}ms, total_time: {total_time}ms\nbatch_size: {batch_size}, throughput: {throughput} tokens/sec')
+        if streamer is not None:
+            streamer.end()
+        # print(input_ids)
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return GenerateEncoderDecoderOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    encoder_attentions=encoder_attentions,
+                    encoder_hidden_states=encoder_hidden_states,
+                    decoder_attentions=decoder_attentions,
+                    cross_attentions=cross_attentions,
+                    decoder_hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                )
+            else:
+                return GenerateDecoderOnlyOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    attentions=decoder_attentions,
+                    hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                )
+        else:
+            return input_ids
+
+# Modified UpSample1d.forward: Uses `conv_transpose2d` instead of `conv_transpose1d` as a workaround for NPU.
+def unsample1d(self, x):
+    _, C, _ = x.shape
+
+    x = F.pad(x, (self.pad, self.pad), mode="replicate")
+    kernel = self.filter.expand(C, -1, -1).unsqueeze(-1)
+    x = self.ratio * F.conv_transpose2d(x.unsqueeze(-1), kernel, stride=(self.stride, 1), groups=C)
+    x = x.squeeze(-1)
+    x = x[..., self.pad_left : -self.pad_right]
+
+    return x
+
+
+def npu_reflect_pad1d(x, paddings, mode, value):
+    padding_left, padding_right = paddings
+    # x: (..., L)
+    shape = x.shape
+    length = shape[-1]
+    # reshape to 4D: (N*, 1, 1, L)
+    flat = x.reshape(-1, 1, 1, length)
+    pad2d = (padding_left, padding_right, 0, 0)
+    padded = F.pad(flat, pad2d, mode, value)
+    padded = padded.reshape(*shape[:-1], padded.shape[-1])
+    return padded
+
+
+# Modified encodec.pad1d: Uses `npu_reflect_pad1d` which implements 1D reflect padding using 4D padding as a workaround.
+def npu_pad1d(x: torch.Tensor, paddings: Tuple[int, int], mode: str = 'zero', value: float = 0.):
+    """Tiny wrapper around F.pad, just to allow for reflect padding on small input.
+    If this is the case, we insert extra 0 padding to the right before the reflection happen.
+    """
+    length = x.shape[-1]
+    padding_left, padding_right = paddings
+    assert padding_left >= 0 and padding_right >= 0, (padding_left, padding_right)
+    if mode == 'reflect':
+        max_pad = max(padding_left, padding_right)
+        extra_pad = 0
+        if length <= max_pad:
+            extra_pad = max_pad - length + 1
+            x = F.pad(x, (0, extra_pad))
+        # padded = F.pad(x, paddings, mode, value)
+        padded = npu_reflect_pad1d(x, paddings, mode, value)
+        end = padded.shape[-1] - extra_pad
+        return padded[..., :end]
+    else:
+        return F.pad(x, paddings, mode, value)
+
+
+def rotate_emb_npu(x, freqs_cis):
+    # x: [bsz, seqlen, n_head, head_dim]
+    # freqs_cis: [seqlen, head_dim // 2, 2]
+    xshaped = x.float().reshape(*x.shape[:-1], -1, 2) # [bsz, seqlen, n_head, head_dim // 2, 2]
+    x0, x1 = xshaped.split(1, dim=-1)
+    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2) # [1, seqlen, 1, head_dim // 2, 2]
+    cos, sin = freqs_cis.split(1, dim=-1)
+    x_out2 = torch.stack(
+        [
+            x0 * cos - x1 * sin,
+            x1 * cos + x0 * sin,
+        ],
+        -1,
+    )
+
+    x_out2 = x_out2.flatten(3)
+    return x_out2.type_as(x)
 
 # 函数替换
 IndexTTS2.infer_fast = infer_fast
@@ -1382,12 +1699,16 @@ GPT2InferenceModel.decode_with_embedding = decode_with_embedding
 GPT2InferenceModel.prepare_inputs_for_generation = prepare_inputs_for_generation
 GPT2InferenceModel.forward = gpt_forward
 LearnedPositionEmbeddings.get_fixed_embedding_with_tensor_input = get_fixed_embedding_with_tensor_input
-DiT.forward_original = dit_forward
-DiT.forward = dit_forward_wapper
-Attention.forward = dit_attn_forward
+DiT.forward = dit_forward
+
 GPT2Attention.forward = gpt_attn_forward
 torchaudio.compliance.kaldi.fbank=fbank
 GPT2Model.forward = gpt2model_forward
+GenerationMixin._sample = _sample
+UpSample1d.forward = unsample1d
+encodec.pad1d = npu_pad1d
+CFM.solve_euler = solve_euler
+gpt_fast.model.Attention.forward = dit_attn_forward
 
 if __name__ == "__main__":
     import os
@@ -1434,9 +1755,8 @@ if __name__ == "__main__":
             with_flops=False,
             experimental_config=experimental_config)
     tts = IndexTTS2NPU(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_cuda_kernel=True, use_fp16=True, static=True)
-    # breakpoint()
     prompt_wav = "examples/voice_01.wav"
-    length=10
+    length=25
     text = 'a' * length # warmup
     tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=False)
     if enable_prof: 
@@ -1448,19 +1768,10 @@ if __name__ == "__main__":
         file='gen2.wav'
         path=output_dir+'/'+file
         prompt_wav = "examples/voice_01.wav"
-        text = '翻译翻译什么叫惊喜'
-        tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path=path, verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=False)
-        # meta='|'.join([file, '翻译翻译什么叫惊喜', 'voice_01.wav', text, ''])
-        # with open('meta.lst', 'w', encoding='utf-8') as f:
-        #     f.write(meta)
-        # loop=2
-        # for length in [256, 300, 400, 512, 800, 1024]:
-        #     print('testing length: ', length)
-        #     for i in range(loop):
-        #         # text = '短句。'
-        #         # text = '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。朝辞白帝彩云间，千里江陵一日还。两岸猿声啼不住，轻舟已过万重山。风急天高猿啸哀，渚清沙白鸟飞回。无边落木萧萧下，不尽长江滚滚来。万里悲秋常作客，百年多病独登台。艰难苦恨繁霜鬓，潦倒新停浊酒杯。唧唧复唧唧，木兰当户织。不闻机杼声，惟闻女叹息。脱我战时袍，著我旧时裳。当窗理云鬓，对镜帖花黄。明月几时有？把酒问青天。不知天上宫阙，今夕是何年。我欲乘风归去，又恐琼楼玉宇，高处不胜寒。起舞弄清影，何似在人间。但愿人长久，千里共婵娟。千山鸟飞绝，万径人踪灭。孤舟蓑笠翁，独钓寒江雪。故人西辞黄鹤楼，烟花三月下扬州。孤帆远影碧空尽，唯见长江天际流。'
-        #         text = ''.join(random.choices(string.ascii_letters, k=length))
-        #         tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen2.wav", verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=True)
+        texts = ['春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。']*10 + [''.join(random.choices(string.ascii_letters, k=length))]*2
+        for i, text in enumerate(texts):
+            print('i text', i, text)
+            tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path=output_dir+'/gen2_'+str(i)+'.wav', verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=False)
     if enable_prof:
         prof.step()
         prof.stop()
