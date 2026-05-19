@@ -183,7 +183,7 @@ campplus_ckpt_path = "./models/iic/speech_campplus_sv_zh-cn_16k-common/campplus_
 bigvgan_name = './models/nv-community/bigvgan_v2_22khz_80band_256x'
 ```
 
-### 4.2 修改infer_v2_npu.py
+### 4.2 修改infer_v2_npu.py（已修改）
 
 ```python
 def get_fixed_embedding_with_tensor_input(self, ind):
@@ -193,7 +193,7 @@ def get_fixed_embedding_with_tensor_input(self, ind):
     return self.emb(ind).unsqueeze(0)
 ```
 
-### 4.3 修改webui.py
+### 4.3 修改webui.py（已修改）
 
 ```python
 # 51行
