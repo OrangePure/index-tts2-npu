@@ -969,6 +969,9 @@ def gpt_forward(
 
 # New function: Allows tensor input for position index, required for static graph compilation.
 def get_fixed_embedding_with_tensor_input(self, ind):
+    #  新增以下判断，避免torch组图抛出ind Nonetype异常
+    if ind is None:
+        return torch.zeros(1, 1, self.emb.embedding_dim, device=self.emb.weight.device)
     return self.emb(ind).unsqueeze(0)
 
 # Modified gpt_fast.model.Attention.forward: Modified to use `torch_npu.npu_fused_infer_attention_score` and `rotate_emb_npu`.

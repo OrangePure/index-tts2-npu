@@ -48,17 +48,25 @@ for file in [
         sys.exit(1)
 
 import gradio as gr
-from indextts.infer_v2 import IndexTTS2
+#  from indextts.infer_v2 import IndexTTS2
+from indextts.infer_v2_npu import IndexTTS2NPU
 from tools.i18n.i18n import I18nAuto
 
 i18n = I18nAuto(language="Auto")
 MODE = 'local'
-tts = IndexTTS2(model_dir=cmd_args.model_dir,
-                cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
-                use_fp16=cmd_args.fp16,
-                use_deepspeed=cmd_args.deepspeed,
-                use_cuda_kernel=cmd_args.cuda_kernel,
-                )
+tts = IndexTTS2NPU(
+    cfg_path="checkpoints/config.yaml",
+    model_dir="checkpoints",
+    use_cuda_kernel=True,
+    use_fp16=True,
+    static=True
+)
+# tts = IndexTTS2(model_dir=cmd_args.model_dir,
+#                 cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
+#                 use_fp16=cmd_args.fp16,
+#                 use_deepspeed=cmd_args.deepspeed,
+#                 use_cuda_kernel=cmd_args.cuda_kernel,
+#                 )
 # 支持的语言列表
 LANGUAGES = {
     "中文": "zh_CN",
